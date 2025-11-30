@@ -24,17 +24,29 @@ The mask is built from a random number of short contiguous segments whose
 lengths and locations are sampled from Poisson-distributed spans and random
 directions. If no positions were selected, the mask falls back to all `true`.
 """
+#Changed since condsegment_v1.jld was trained!
 function rand_sub_mask(chainids)
     l = length(chainids)
     mask = falses(l)
-    length_scale = rand() * 30                    #Changed since condsegment_v1.jld was trained
-    for _ in 1:(1+rand(Poisson(rand()*12)))
-        dir = rand([-1,1])
-        pos = rand(1:l)
-        #span = rand(Poisson(rand()*30))          #Changed since condsegment_v1.jld was trained
-        span = rand(Poisson(rand()*length_scale)) #Changed since condsegment_v1.jld was trained
-        ordered = minmax(pos, pos + dir*span)
-        mask[max(1,ordered[1]):min(l,ordered[2])] .= true
+    if rand() < 0.5 #Designable segments, tend to be long-ish
+        length_scale = 30
+        for _ in 1:(1+rand(Poisson(rand()*12)))
+            dir = rand([-1,1])
+            pos = rand(1:l)
+            span = rand(Poisson(rand()*length_scale))
+            ordered = minmax(pos, pos + dir*span)
+            mask[max(1,ordered[1]):min(l,ordered[2])] .= true
+        end
+    else #Fixed segments (everything else designable), can be long or short
+        mask .= true
+        length_scale = rand()*30
+        for _ in 1:(1+rand(Poisson(rand()*3)))
+            dir = rand([-1,1])
+            pos = rand(1:l) 
+            span = rand(Poisson(rand()*length_scale))
+            ordered = minmax(pos, pos + dir*span)
+            mask[max(1,ordered[1]):min(l,ordered[2])] .= false
+        end
     end
     if !any(mask)
         mask .= true
