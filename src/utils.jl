@@ -143,11 +143,18 @@ sequence segments.
   each substring in the flattened sequence is masked (designable). An error is
   thrown if any substring is not found.
 """
-function X1_from_pdb(pdb_rec, segments_to_mask::Vector{String})
+function X1_from_pdb(pdb_rec, segments_to_mask::Vector{String}; exclude_flatchain_nums = Int[])
     pdb_rec.cluster = 1
     rec = DLProteinFormats.flatten(pdb_rec)
     L = length(rec.AAs)
-    flatAAstring = join(DLProteinFormats.AAs[rec.AAs])
+    #new bit
+    flatAA_chars = collect(join(DLProteinFormats.AAs[rec.AAs]))
+    for ex in exclude_flatchain_nums
+        flatAA_chars[rec.chainids .== ex] .= '!'
+    end
+    #end new bit
+    flatAAstring = join(flatAA_chars)
+    #flatAAstring = join(DLProteinFormats.AAs[rec.AAs])
     cmask = falses(length(flatAAstring))
     for segment in segments_to_mask
         matches = findall(segment, flatAAstring)
