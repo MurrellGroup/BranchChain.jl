@@ -1,3 +1,16 @@
+#=Self conditioning strategy:
+1) During training, half the samples will have duplicated residues anyway (because we sample t from the coalescence events 50% of the time). Deletions are not handled though.
+2) During inference, we'll take split residues and dup them (and remove deleted residues - this is risky).
+3) We can always do self-cond and recycling if this misbehaves? Maybe recycling on deletions only? That should be only be ~10% of steps.
+=#
+
+
+#We'll use this to track index changes from splits
+struct NullProcess <: Flowfusion.Process end
+Flowfusion.endpoint_conditioned_sample(Xa, Xc, p::NullProcess, t_a, t_b, t_c) = Xa
+Flowfusion.step(P::NullProcess, Xₜ::Flowfusion.MaskedState, X1targets, s₁, s₂) = Xₜ
+
+
 oldAdaLN(dim,cond_dim) = AdaLN(Flux.LayerNorm(dim), Dense(cond_dim, dim), Dense(cond_dim, dim))
 ipa(l, f, x, pf, c, m) = l(f, x, pair_feats = pf, cond = c, mask = m)
 crossipa(l, f1, f2, x, pf, c, m) = l(f1, f2, x, pair_feats = pf, cond = c, mask = m)
@@ -93,9 +106,10 @@ function (fc::BranchChainV1)(t, BSXt, chainids, resinds, breaks; sc_frames = not
     return frames, aa_logits, count_log, del_logits
 end
 
-P = CoalescentFlow(((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
+P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
-                     DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)))), 
+                     DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)),
+                     NullProcess()), 
                     Beta(1,2))
 
 const rotM = Flowfusion.Rotations(3)
@@ -109,7 +123,8 @@ random SO(3) rotations, and a single dummy amino-acid state (index 21).
 """
 X0sampler(root) = (ContinuousState(randn(Float32, 3, 1, 1)), 
                     ManifoldState(rotM, reshape(Array{Float32}.(Flowfusion.rand(rotM, 1)), 1)),
-                    (DiscreteState(21, [21]))
+                    DiscreteState(21, [21]),
+                    DiscreteState(0, [1]) #<-INDEXING STATE.
 )
 
 """
@@ -136,7 +151,8 @@ function compoundstate(rec)
     X1locs = MaskedState(ContinuousState(rec.locs), cmask, cmask)
     X1rots = MaskedState(ManifoldState(rotM,eachslice(rec.rots, dims=3)), cmask, cmask)
     X1aas = MaskedState((DiscreteState(21, rec.AAs)), cmask, cmask)
-    X1 = BranchingState((X1locs, X1rots, X1aas), rec.chainids, flowmask = cmask, branchmask = cmask) #<- .state, .groupings
+    index_state = MaskedState((DiscreteState(0, [1:L;])), cmask, cmask)
+    X1 = BranchingState((X1locs, X1rots, X1aas, index_state), rec.chainids, flowmask = cmask, branchmask = cmask) #<- .state, .groupings
     return X1, breaks
 end
 
