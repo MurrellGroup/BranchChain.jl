@@ -4,7 +4,6 @@
 3) We can always do self-cond and recycling if this misbehaves? Maybe recycling on deletions only? That should be only be ~10% of steps.
 =#
 
-
 #We'll use this to track index changes from splits
 struct NullProcess <: Flowfusion.Process end
 Flowfusion.endpoint_conditioned_sample(Xa, Xc, p::NullProcess, t_a, t_b, t_c) = Xa
@@ -106,6 +105,70 @@ function (fc::BranchChainV1)(t, BSXt, chainids, resinds, breaks; sc_frames = not
     return frames, aa_logits, count_log, del_logits
 end
 
+
+struct BranchChainV2{L}
+    layers::L
+end
+Flux.@layer BranchChainV2
+function BranchChainV2(dim::Int = 384, depth::Int = 6, f_depth::Int = 6; config = nothing)
+    layers = (;
+        config = config, #Suggestion: make these so you can extract them with `eval(Meta.parse(model.layers.config.X))`
+        depth = depth,
+        f_depth = f_depth,
+        mask_embedder = Embedding(2 => dim),
+        break_embedder = Embedding(2 => dim),
+        t_rff = RandomFourierFeatures(1 => dim, 1f0),
+        cond_t_encoding = Dense(dim => dim, bias=false),
+        AApre_t_encoding = Dense(dim => dim, bias=false),
+        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
+        pair_project = Dense(64 => 32, bias=false),
+        AA_embedder = Embedding(21 => dim),
+        selfcond_crossipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        selfcond_selfipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = oldAdaLN(dim, dim), ln2 = oldAdaLN(dim, dim)) for _ in 1:depth],
+        framemovers = [Framemover(dim) for _ in 1:f_depth],
+        AAdecoder = Chain(StarGLU(dim, 3dim), Dense(dim => 21, bias=false)),
+        indelpre_t_encoding = Dense(dim => 3dim),
+        count_decoder = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        feature_embedder = StarGLU(Dense(96 => 2dim, bias=false), Dense(2dim => dim, bias=false), Dense(96 => 2dim, bias=false), Flux.swish) #New thing
+    )
+    return BranchChainV2(layers)
+end
+function (fc::BranchChainV2)(t, BSXt, chainids, resinds, breaks, chain_features; sc_frames = nothing)
+    l = fc.layers
+    Xt = BSXt.state
+    cmask = BSXt.flowmask
+    pmask = Flux.Zygote.@ignore self_att_padding_mask(BSXt.padmask)
+    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
+    pair_feats = l.pair_project(pre_z)
+    t_rff = Flux.Zygote.@ignore l.t_rff(t)
+    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
+    frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))
+    x = l.AA_embedder(tensor(Xt[3])) .+ l.mask_embedder(cmask .+ 1) .+ reshape(l.break_embedder(breaks .+ 1), :, 1, size(t,2)) .+ l.feature_embedder(chain_features .+ 0, false)
+    x_a,x_b,x_c = nothing, nothing, nothing
+    for i in 1:l.depth
+        if sc_frames !== nothing
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_selfipa[i], sc_frames, sc_frames, x, pair_feats, cond, pmask)
+            f1, f2 = mod(i, 2) == 0 ? (frames, sc_frames) : (sc_frames, frames)
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_crossipa[i], f1, f2, x, pair_feats, cond, pmask)
+        end
+        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
+        if i > l.depth - l.f_depth
+            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t .* 0.95f0).*cmask)
+        end
+        if i==4 (x_a = x) end
+        if i==5 (x_b = x) end
+        if i==6 (x_c = x) end
+    end
+    aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))
+    catted = vcat(x_a,x_b,x_c)
+    indel_pre_t = reshape(l.indelpre_t_encoding(t_rff), :, 1, size(t,2))
+    count_log = reshape(l.count_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    del_logits = reshape(l.del_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    return frames, aa_logits, count_log, del_logits
+end
+
 P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
                      DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)),
@@ -144,6 +207,7 @@ Returns `(X1, breaks)`, where:
 - `breaks`: Boolean indicating whether there are any sequence breaks inside
   the masked region (used as an additional conditioning signal).
 """
+#NEEDS TO RETURN PDB AND CHAIN LABELS
 function compoundstate(rec)
     L = length(rec.AAs)
     cmask = rand_mask(rec.chainids)
@@ -153,7 +217,7 @@ function compoundstate(rec)
     X1aas = MaskedState((DiscreteState(21, rec.AAs)), cmask, cmask)
     index_state = MaskedState((DiscreteState(0, [1:L;])), cmask, cmask)
     X1 = BranchingState((X1locs, X1rots, X1aas, index_state), rec.chainids, flowmask = cmask, branchmask = cmask) #<- .state, .groupings
-    return X1, breaks
+    return X1, breaks, DLProteinFormats.pdbid_clean(rec.name), rec.chain_labels
 end
 
 """
