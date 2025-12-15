@@ -41,10 +41,12 @@ For batch indices `b`, samples masked terminal states from `dat`, builds a branc
 returns a named tuple with all inputs and targets needed by `BranchChainV1`
 and `losses`.
 """
-function training_prep(b, dat, deletion_pad, X0_mean_length; P = P)
+function training_prep(b, dat, deletion_pad, X0_mean_length, feature_func; P = P)
     sampled = compoundstate.(dat[b])
     X1s = [s[1] for s in sampled]
     hasnobreaks = [s[2] for s in sampled]
+    pdb_ids = [s[3] for s in sampled]
+    chain_labels = [s[4] for s in sampled]
     t = Uniform(0f0,1f0)
     bat = branching_bridge(P, X0sampler, X1s, t, 
                             coalescence_factor = 1.0, 
@@ -54,12 +56,16 @@ function training_prep(b, dat, deletion_pad, X0_mean_length; P = P)
                             deletion_pad = deletion_pad,
                             X1_modifier = X1_modifier,
                         )
+
+    #Feature code here:
+    chain_features = broadcast_features(pdb_ids, chain_labels, bat.Xt.groupings, feature_func)
+
     rotξ = Guide(bat.Xt.state[2], bat.X1anchor[2])
     resinds = similar(bat.Xt.groupings) .= 1:size(bat.Xt.groupings, 1) #We should consider using native res inds for the residues fixed in conditioning.
     return (;t = bat.t, chainids = bat.Xt.groupings, resinds,
                     Xt = bat.Xt, hasnobreaks = hasnobreaks,
                     rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], X1aas_target = bat.X1anchor[3],
-                    splits_target = bat.splits_target, del = bat.del)
+                    splits_target = bat.splits_target, del = bat.del, chain_features)
 end
 
 """
@@ -78,40 +84,13 @@ Build a step function compatible with `gen` that calls the design model.
 - `frameid`: single-element vector holding a mutable frame counter used in
   file naming; typically left at the default.
 """
-#=
-function step_spec(model; recycles = 3, vidpath = nothing, printseq = true, device = identity, frameid = [1])
-    sc_frames = nothing
-    index_tracking = nothing
-    function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
-        !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
-        if isnothing(index_tracking)
-        Xtstate = Xₜ.state
-        printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
-        if length(tensor(Xtstate[3])[:]) > 2000
-            error("Chain too long")
-        end
-        resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
-        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true]) |> device
-        sc_frames, _ = model(input_bundle...)
-        for _ in 1:recycles
-            sc_frames, _ = model(input_bundle..., sc_frames = sc_frames)
-        end
-        pred = model(input_bundle..., sc_frames = sc_frames) |> cpu
-        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(cpu(values(linear(pred[1]))), dims=(3,4))), pred[2], nothing
-        !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3]), Xₜ.groupings, collect(1:length(Xₜ.groupings)))
-        frameid[1] += 1
-        return state_pred, pred[3], pred[4]
-    end
-    return mod_wrapper
-end
-=#
-
-function step_spec(model; recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1])
+function step_spec(model, pdb_id, chain_labels, feature_func; recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing)
     sc_frames = nothing
     function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
         !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
         Xtstate = Xₜ.state
-        frominds = Xtstate[4].S.state[:]        
+        frominds = Xtstate[4].S.state[:]
+        chain_features = broadcast_features([pdb_id], [chain_labels], Xₜ.groupings, (a,b) -> feature_func(a,b,override = feature_override))
         if !isnothing(sc_frames)
             sc_frames = Translation(sc_frames.composed.outer.values[:,:,frominds,:]) ∘ Rotation(sc_frames.composed.inner.values[:,:,frominds,:])
         end
@@ -120,7 +99,7 @@ function step_spec(model; recycles = 0, vidpath = nothing, printseq = true, devi
             error("Chain too long")
         end
         resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
-        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true]) |> device
+        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
         for _ in 1:recycles
             sc_frames, _ = model(input_bundle..., sc_frames = gpu(sc_frames))
         end
@@ -145,6 +124,7 @@ Sample a random masked target `X1` from the dataset to use as a template.
 - `only_sampled_masked`: when `true`, keeps resampling until at least one
   residue is masked in the sampled example (up to 100 tries).
 """
+#NEEDS TO PASS THROUGH PDB AND CHAIN IDS
 function random_template(dat; only_sampled_masked = true)
     b = rand(findall(dat.len .< 1000))
     sampled = compoundstate.(dat[[b]])
@@ -178,6 +158,7 @@ sequence segments.
   each substring in the flattened sequence is masked (designable). An error is
   thrown if any substring is not found.
 """
+#Needs to handle/return features:
 function X1_from_pdb(pdb_rec, segments_to_mask::Vector{String}; exclude_flatchain_nums = Int[])
     pdb_rec.cluster = 1
     rec = DLProteinFormats.flatten(pdb_rec)
@@ -185,7 +166,7 @@ function X1_from_pdb(pdb_rec, segments_to_mask::Vector{String}; exclude_flatchai
     #new bit
     flatAA_chars = collect(join(DLProteinFormats.AAs[rec.AAs]))
     for ex in exclude_flatchain_nums
-        flatAA_chars[rec.chainids .== ex] .= '!'
+        flatAA_chars[rec.chainids .== ex] .= '!' #Set bits of sequence to be un-matchable
     end
     #end new bit
     flatAAstring = join(flatAA_chars)
@@ -240,8 +221,10 @@ given masked target `X1`.
 
 Returns the final sampled branching state `samp`.
 """
-function design(model, X1; steps = step_sched.(0f0:0.005:1f0),
-                path = nothing, vidpath = nothing, printseq = true, device = identity, 
+#Needs to consider features/feature modifications.
+#This should be generalized to also be allowed to take in features directly. Or something.
+function design(model, X1, pdb_id, chain_labels, feature_func; steps = step_sched.(0f0:0.005:1f0),
+                path = nothing, vidpath = nothing, printseq = true, device = identity, feature_override = nothing,
                 P = P, X0_mean_length = model.layers.config.X0_mean_length_minus_1, deletion_pad = model.layers.config.deletion_pad, recycles = 0)
     if steps isa Number
         steps = step_sched.(0f0:Float32(1/steps):1f0)
@@ -261,7 +244,7 @@ function design(model, X1; steps = step_sched.(0f0:0.005:1f0),
         mkpath(vidpath*"/Xt")
         mkpath(vidpath*"/X1hat")
     end
-    samp = gen(P, X0, step_spec(model; vidpath, printseq, device, frameid, recycles), steps)
+    samp = gen(P, X0, step_spec(model, pdb_id, chain_labels, feature_func; vidpath, printseq, device, frameid, recycles, feature_override), steps)
     printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(samp.state[3])[:]), "X"=>"-"), ":", frameid[1])
     !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", samp.state, samp.groupings, collect(1:length(samp.groupings)))
     !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", samp.state, samp.groupings, collect(1:length(samp.groupings)))
