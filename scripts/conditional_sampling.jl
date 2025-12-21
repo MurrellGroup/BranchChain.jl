@@ -1,13 +1,15 @@
 using Pkg
-Pkg.activate(".")
-using Revise
-Pkg.develop(path = "../")
+Registry.add(url="https://github.com/MurrellGroup/MurrellGroupRegistry")
+Pkg.activate(temp=true)
+Pkg.develop(path=joinpath(@__DIR__, ".."))
+Pkg.add(["DLProteinFormats", "CUDA", "cuDNN"])
 
-ENV["CUDA_VISIBLE_DEVICES"] = 1
-using BranchChain, CUDA, DLProteinFormats
+ENV["CUDA_VISIBLE_DEVICES"] = 0
+using CUDA, cuDNN
+device!(0) # <- pick your GPU (zero indexed)
 
-device!(0) #<-pick your GPU (zero indexed)
-devi = BranchChain.gpu
+using BranchChain
+dev = BranchChain.gpu
 
 model = load_model("branchchain_feat64.jld") |> devi;
 
