@@ -85,7 +85,7 @@ Build a step function compatible with `gen` that calls the design model.
   file naming; typically left at the default.
 """
 #Self cond bug? Indexing state not being updated properly?
-function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labels, feature_func; 
+function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labels, feature_func; hook = nothing,
     recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
     sc_frames = nothing
     function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
@@ -103,12 +103,13 @@ function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labe
         resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
         input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
         for _ in 1:recycles
-            sc_frames, _ = model(input_bundle..., sc_frames = gpu(sc_frames))
+            sc_frames, _ = model(input_bundle..., sc_frames = device(sc_frames))
         end
-        pred = model(input_bundle..., sc_frames = gpu(sc_frames)) |> cpu
+        pred = model(input_bundle..., sc_frames = device(sc_frames)) |> device
         sc_frames = deepcopy(pred[1])
-        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(cpu(values(linear(pred[1]))), dims=(3,4))), pred[2], nothing
+        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(values(linear(pred[1])), dims=(3,4))), pred[2], nothing
         !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3]), Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+        !isnothing(hook) && hook(Xₜ.groupings, Xₜ.state, state_pred)
         frameid[1] += 1
         Xtstate[4].S.state .= 1:length(Xtstate[4].S.state) #<-Update the indexing state? Not being used.
         return state_pred, pred[3], pred[4]
@@ -121,7 +122,7 @@ end
 #The symmetry will be enfoced at the "step" for the discrete components, but the "prediction" level for the continuous ones.
 
 #Need to think about how to handle both conditional and unconditional models more gracefully than a code-duplicated dispatch.
-function step_spec(model::BranchChainV1, pdb_id, chain_labels, feature_func; transform_array = [], recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing)
+function step_spec(model::BranchChainV1, pdb_id, chain_labels, feature_func; hook = nothing, transform_array = [], recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing)
     sc_frames = nothing
     expanded_sc_frames = nothing
     function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
@@ -277,7 +278,7 @@ Returns the final sampled branching state `samp`.
 #Needs to consider features/feature modifications.
 #This should be generalized to also be allowed to take in features directly. Or something.
 function design(model, X1, pdb_id, chain_labels, feature_func; steps = step_sched.(0f0:0.005:1f0), transform_array = [],
-                path = nothing, vidpath = nothing, printseq = true, device = identity, feature_override = nothing,
+                path = nothing, vidpath = nothing, printseq = true, device = identity, feature_override = nothing, hook = nothing,
                 P = P, X0_mean_length = model.layers.config.X0_mean_length_minus_1, deletion_pad = model.layers.config.deletion_pad, recycles = 0)
     if steps isa Number
         steps = step_sched.(0f0:Float32(1/steps):1f0)
@@ -297,7 +298,7 @@ function design(model, X1, pdb_id, chain_labels, feature_func; steps = step_sche
         mkpath(vidpath*"/Xt")
         mkpath(vidpath*"/X1hat")
     end
-    samp = gen(P, X0, step_spec(model, pdb_id, chain_labels, feature_func; vidpath, printseq, device, frameid, recycles, feature_override, transform_array), steps)
+    samp = gen(P, X0, step_spec(model, pdb_id, chain_labels, feature_func; vidpath, printseq, device, frameid, recycles, feature_override, transform_array, hook), steps)
     expanded_samp = expand_state(samp, transform_array)
     printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(expanded_samp.state[3])[:]), "X"=>"-"), ":", frameid[1])
     !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)))
