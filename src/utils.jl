@@ -105,7 +105,7 @@ function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labe
         for _ in 1:recycles
             sc_frames, _ = model(input_bundle..., sc_frames = device(sc_frames))
         end
-        pred = model(input_bundle..., sc_frames = device(sc_frames)) |> device
+        pred = model(input_bundle..., sc_frames = device(sc_frames)) |> cpu
         sc_frames = deepcopy(pred[1])
         state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(values(linear(pred[1])), dims=(3,4))), pred[2], nothing
         !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3]), Xₜ.groupings, collect(1:length(Xₜ.groupings)))
