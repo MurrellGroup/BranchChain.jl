@@ -3,25 +3,28 @@ Pkg.activate(".")
 using Revise
 Pkg.develop(path = "../")
 
+#]add Flux, Distributions, Dates, DLProteinFormats, LearningSchedules, CannotWaitForTheseOptimisers, JLD2, CUDA@5.9.5, cuDNN
+#]add Revise
+
 using BranchChain
 using Flux, Distributions, Dates
-using DLProteinFormats: load, PDBSimpleFlatV2, PDBClusters, PDBTable, sample_batched_inds, length2batch, featurizer, CHAIN_FEATS_V1, broadcast_features, pdbid_clean
+using DLProteinFormats: load, CHAIN_FEATS_64, PDBSimpleFlatV2, PDBClusters, PDBTable, sample_batched_inds, length2batch, featurizer, CHAIN_FEATS_V1, broadcast_features, pdbid_clean
 using LearningSchedules
 using CannotWaitForTheseOptimisers: Muon
 using JLD2: jldsave
 
-ENV["CUDA_VISIBLE_DEVICES"] = 1
-using CUDA
+ENV["CUDA_VISIBLE_DEVICES"] = 0
+using CUDA, cuDNN
 
+device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
+
+device = gpu
 
 X0_mean_length = 0
 deletion_pad = 1.1
 per_chain_upper_X0_len = 1 + quantile(Poisson(X0_mean_length), 0.95)
 
-device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
-device = gpu
-
-rundir = "runs/branchchain_featurecond_finetune_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/branchchain_pairloss1_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 mkpath("$(rundir)/vids")
 
@@ -29,22 +32,19 @@ dat = load(PDBSimpleFlatV2);
 feature_table = load(PDBTable);
 pdb_clusters = load(PDBClusters);
 
-train_ff = featurizer(feature_table, CHAIN_FEATS_V1)
-sampling_ff = featurizer(feature_table, CHAIN_FEATS_V1)
+train_ff = featurizer(feature_table, CHAIN_FEATS_64, all_mask_prob = 0.05, feat_mask_prob = Beta(1,5))
+sampling_ff = featurizer(feature_table, CHAIN_FEATS_64)
 clusters = [pdb_clusters[c] for c in pdbid_clean.(dat.name)]
 
 #To prevent OOM, we now need to factor in that some low-t samples might have more elements than their X1 lengths:
 len_lbs = max.(dat.len, length.(union.(dat.chainids)) .* per_chain_upper_X0_len) .* deletion_pad
 
-#model = load_model("condsegment_v1.jld") |> device;
-V1layers = load_model("branchchain_tune1.jld").layers;
-v2_scaf = BranchChain.BranchChainV2(config = V1layers.config);
-model = BranchChain.BranchChainV2(merge(v2_scaf.layers, V1layers)) |> device;
-model.layers.feature_embedder.w2.weight ./= 5;
+model = load_model("branchchain_feat64_30tune.jld") |> device;
 
-sched = burnin_learning_schedule(0.00001f0, 0.000250f0, 1.05f0, 0.9999f0)
-opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> any(size(x) .== 21)), model)
-Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
+sched = burnin_learning_schedule(0.00001f0, 0.000250f0, 1.05f0, 0.999995f0);
+opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> any(size(x) .== 21)), model);
+
+Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing);
 
 struct BatchDataset{T}
     batchinds::T
@@ -60,8 +60,11 @@ function batchloader(; device=identity, parallel=true)
     return device(dataloader)
 end
 
-Flux.freeze!(opt_state)
-Flux.thaw!(opt_state.layers.feature_embedder)
+#=
+ts = training_prep([1,2], dat, deletion_pad, X0_mean_length, train_ff) |> device
+sc_frames = nothing
+hat_frames, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc_frames)
+=#
 
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
 for epoch in 1:6
@@ -69,20 +72,17 @@ for epoch in 1:6
         sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5800) 
     end
     for (i, ts) in enumerate(batchloader(; device = device))
-        if epoch == 1 && i == 2000 #<-First 2000 batches only training the feature embedder
-            Flux.thaw!(opt_state)
-            sched = burnin_learning_schedule(0.00001f0, 0.000250f0, 1.05f0, 0.9999f0)
-            break;
-        end
         sc_frames = nothing
         for _ in 1:rand(Poisson(1))
             sc_frames, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc_frames)
         end
+        @show ts.t
         l, grad = Flux.withgradient(model) do m
             frames, aa_logits, count_log, del_logit = m(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc_frames)
             l_loc, l_rot, l_aas, l_splits, l_del = losses(BranchChain.P, (frames, aa_logits, count_log, del_logit), ts)
-            @show l_loc, l_rot, l_aas, l_splits, l_del
-            l_loc + l_rot + l_aas + l_splits + l_del
+            pair_aux_loss = aux_losses(frames, ts)
+            @show l_loc, l_rot, l_aas, l_splits, l_del , pair_aux_loss
+            l_loc + l_rot + l_aas + l_splits + l_del + pair_aux_loss
         end
         Flux.update!(opt_state, model, grad[1])
         (mod(i, 10) == 0) && Flux.adjust!(opt_state, next_rate(sched))
@@ -106,4 +106,5 @@ for epoch in 1:6
     jldsave("$(rundir)/model_epoch_$(epoch).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 end
 
-BranchChain.jldsave("$(rundir)/branchchain_featurecond_v1.jld", model_state = cpu(model));
+BranchChain.jldsave("$(rundir)/branchchain_feat64_pairloss.jld", model_state = cpu(model));
+

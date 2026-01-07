@@ -314,5 +314,20 @@ function losses(P, X1hat, ts)
     return l_loc, l_rot, l_aas, splits_loss, del_loss
 end
 
+#sigmoid that ramps up after 0.5:
+pairwise_weight(time::T) where T = T(1 / (1 + exp(-20 * (time - T(0.5)))))
+#Using clamp to hard-kill distances that are too large:
+batch_dists(p) = sqrt.(clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10f0) .+ 1f-6)
 
-export BranchChainV1, losses, X0sampler, compoundstate
+function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists = batch_dists)
+    times = ts.t
+    time_weights = reshape(pair_weight.(times), 1, 1, length(times))
+    mask = (ts.Xt.padmask .* ts.Xt.branchmask) .+ 0f0
+    hat_loc = values(BranchChain.BatchedTransformations.translation(hat_frames))
+    hat_dists = batch_dists(hat_loc)
+    true_dists = batch_dists(ts.X1_locs_target.S.state)
+    weighted_dists = sqrt.((hat_dists .- true_dists).^2 .+ 1f-6) .* time_weights
+    return sum(sum(weighted_dists, dims = 1) .* reshape(mask, 1, size(mask)...)) / (10 * sum(mask) + 1)
+end
+
+export BranchChainV1, losses, aux_losses, X0sampler, compoundstate
