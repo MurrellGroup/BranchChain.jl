@@ -316,18 +316,22 @@ end
 
 #sigmoid that ramps up after 0.5:
 pairwise_weight(time::T) where T = T(1 / (1 + exp(-20 * (time - T(0.5)))))
-#Using clamp to hard-kill distances that are too large:
-batch_dists(p) = sqrt.(clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10f0) .+ 1f-6)
+batch_dists(p) = sqrt.(clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10000f0) .+ 1f-6)
+dist_scaling(d) = 1 ./ (1 .+ d)
 
-function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists = batch_dists)
+pair_and_mask(floatmask) = Onion.rearrange(floatmask, Onion.einops"n ... -> 1 n ...") .* Onion.rearrange(floatmask, Onion.einops"n ... -> n 1 ...")
+pair_or_mask(floatmask) = clamp.(Onion.rearrange(floatmask, Onion.einops"n ... -> 1 n ...") .+ Onion.rearrange(floatmask, Onion.einops"n ... -> n 1 ..."), 0f0, 1f0)
+
+function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists = batch_dists, dist_scaling = dist_scaling)
     times = ts.t
     time_weights = reshape(pair_weight.(times), 1, 1, length(times))
-    mask = (ts.Xt.padmask .* ts.Xt.branchmask) .+ 0f0
+    mask = pair_and_mask(ts.Xt.padmask .+ 0) .* pair_or_mask(ts.Xt.branchmask .+ 0)
     hat_loc = values(BranchChain.BatchedTransformations.translation(hat_frames))
     hat_dists = batch_dists(hat_loc)
     true_dists = batch_dists(ts.X1_locs_target.S.state)
-    weighted_dists = sqrt.((hat_dists .- true_dists).^2 .+ 1f-6) .* time_weights
-    return sum(sum(weighted_dists, dims = 1) .* reshape(mask, 1, size(mask)...)) / (10 * sum(mask) + 1)
+    scal = dist_scaling(true_dists) .* mask
+    weighted_dists = ((hat_dists .- true_dists).^2 .+ 1f-6) .* scal .* time_weights 
+    return 100 * sum(weighted_dists) / sum(scal)
 end
 
 export BranchChainV1, losses, aux_losses, X0sampler, compoundstate

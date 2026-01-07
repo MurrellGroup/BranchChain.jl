@@ -24,7 +24,7 @@ X0_mean_length = 0
 deletion_pad = 1.1
 per_chain_upper_X0_len = 1 + quantile(Poisson(X0_mean_length), 0.95)
 
-rundir = "runs/branchchain_pairloss1_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/branchchain_pairloss_scal1_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 mkpath("$(rundir)/vids")
 
@@ -60,14 +60,7 @@ function batchloader(; device=identity, parallel=true)
     return device(dataloader)
 end
 
-#=
-ts = training_prep([1,2], dat, deletion_pad, X0_mean_length, train_ff) |> device
-sc_frames = nothing
-hat_frames, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc_frames)
-aux_losses(hat_frames, ts)
-ts.t
-=#
-
+starttime = now()
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
 for epoch in 1:6
     if epoch == 5
@@ -88,8 +81,12 @@ for epoch in 1:6
         end
         Flux.update!(opt_state, model, grad[1])
         (mod(i, 10) == 0) && Flux.adjust!(opt_state, next_rate(sched))
+        if mod(i,50) == 0
+            println("\n\nMean time per 50 batches: $((now() - starttime) / 50)\n\n") #6000 Ada: ~53472 milliseconds
+            starttime = now()
+        end
         textlog("$(rundir)/log.csv", [epoch, i, sched.lr, l])
-        if mod(i, 5000) == 1
+        if mod(i, 5000) == 0
             for v in 1:3
                 try
                     sampname = "e$(epoch)_b$(i)_samp$(v)"    
