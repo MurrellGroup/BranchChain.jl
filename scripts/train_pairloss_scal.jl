@@ -3,7 +3,7 @@ Pkg.activate(".")
 using Revise
 Pkg.develop(path = "../")
 
-#]add Flux, Distributions, Dates, DLProteinFormats, LearningSchedules, CannotWaitForTheseOptimisers, JLD2, CUDA@5.9.5, cuDNN
+#]add Flux, Distributions, Dates, DLProteinFormats, LearningSchedules, CannotWaitForTheseOptimisers, JLD2, CUDA, cuDNN
 #]add Revise
 
 using BranchChain
@@ -14,6 +14,7 @@ using CannotWaitForTheseOptimisers: Muon
 using JLD2: jldsave
 
 ENV["CUDA_VISIBLE_DEVICES"] = 0
+#ENV["JULIA_CUDA_HARD_MEMORY_LIMIT"] = "80GiB"
 using CUDA, cuDNN
 
 device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
@@ -24,7 +25,7 @@ X0_mean_length = 0
 deletion_pad = 1.1
 per_chain_upper_X0_len = 1 + quantile(Poisson(X0_mean_length), 0.95)
 
-rundir = "runs/branchchain_pairloss_scal1_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/branchchain_1900_pairloss_scal_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 mkpath("$(rundir)/vids")
 
@@ -52,7 +53,7 @@ end
 Base.length(x::BatchDataset) = length(x.batchinds)
 Base.getindex(x::BatchDataset, i) = training_prep(x.batchinds[i], dat, deletion_pad, X0_mean_length, train_ff)
 function batchloader(; device=identity, parallel=true)
-    uncapped_l2b = length2batch(1500, 1.25)
+    uncapped_l2b = length2batch(1900, 1.25)
     batchinds = sample_batched_inds(len_lbs, clusters, l2b = x -> min(uncapped_l2b(x), 100))
     @show length(batchinds)
     x = BatchDataset(batchinds)
@@ -64,7 +65,7 @@ starttime = now()
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
 for epoch in 1:6
     if epoch == 5
-        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5800) 
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5000) 
     end
     for (i, ts) in enumerate(batchloader(; device = device))
         sc_frames = nothing
@@ -82,7 +83,7 @@ for epoch in 1:6
         Flux.update!(opt_state, model, grad[1])
         (mod(i, 10) == 0) && Flux.adjust!(opt_state, next_rate(sched))
         if mod(i,50) == 0
-            println("\n\nMean time per 50 batches: $((now() - starttime) / 50)\n\n") #6000 Ada: ~53472 milliseconds
+            println("\n\nMean time per 50 batches: $((now() - starttime))\n\n") #6000 Ada: ~53472 milliseconds
             starttime = now()
         end
         textlog("$(rundir)/log.csv", [epoch, i, sched.lr, l])
@@ -105,5 +106,5 @@ for epoch in 1:6
     jldsave("$(rundir)/model_epoch_$(epoch).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 end
 
-BranchChain.jldsave("$(rundir)/branchchain_feat64_pairloss.jld", model_state = cpu(model));
+BranchChain.jldsave("$(rundir)/branchchain_feat64_pairloss_1900.jld", model_state = cpu(model));
 
